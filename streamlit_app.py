@@ -1,161 +1,342 @@
-# app/streamlit_app.py
-import os
-import base64
-import io
-from typing import Optional
 import streamlit as st
 import openai
+from openai import OpenAI
 import requests
+from PIL import Image
+import io
+import base64
+from datetime import datetime
+import os
 
-# Uwaga: biblioteka openai może mieć różne interfejsy w zależności od wersji.
-# Poniżej używamy klasycznego podejścia `openai` z metodą Image.create.
-# Jeśli używasz nowej biblioteki klienta OpenAI, dopasuj wywołanie zgodnie z dokumentacją.
+# Konfiguracja strony
+st.set_page_config(
+    page_title="DALL-E Image Generator",
+    page_icon="🎨",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
 
-# ====== Konfiguracja ======
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY") or st.secrets.get("OPENAI_API_KEY", None)
-st.secrets.get("OPENAI_API_KEY", None)
-if not OPENAI_API_KEY:
-    st.error("Brakuje klucza API OpenAI. Ustaw zmienną środowiskową OPENAI_API_KEY lub użyj Streamlit secrets.")
-    st.stop()
-openai.api_key = OPENAI_API_KEY
+# Inicjalizacja sesji
+if "generated_images" not in st.session_state:
+    st.session_state.generated_images = []
+if "current_image_url" not in st.session_state:
+    st.session_state.current_image_url = None
+if "image_history" not in st.session_state:
+    st.session_state.image_history = []
 
-# ====== Helpers ======
-def make_prompt(fields: dict, modification: Optional[str] = None) -> str:
-    """
-    Skleja pełny prompt z pól zgodnie z szablonem.
-    fields: dict z kluczami:
-        subject, attributes, style, environment, composition, extra, negative
-    modification: opcjonalny tekst z prośbą o poprawkę
-    """
-    parts = []
-    parts.append(f"Subject: {fields.get('subject','')}")
-    parts.append(f"Attributes: {fields.get('attributes','')}")
-    parts.append(f"Style & Aesthetics: {fields.get('style','')}")
-    parts.append(f"Environment / Setting: {fields.get('environment','')}")
-    parts.append(f"Composition / Camera: {fields.get('composition','')}")
-    parts.append(f"Extra details / Atmosphere: {fields.get('extra','')}")
-    negative = fields.get('negative','')
-    if negative:
-        parts.append(f"Negative prompt (avoid): {negative}")
-    if modification:
-        parts.append(f"Modification request: {modification}")
-    # Zwracamy scalony, ale czytelny prompt.
-    return "\n".join(parts)
 
-def generate_image_from_openai(prompt: str, size: str = "1024x1024", n: int = 1) -> bytes:
-    """
-    Wywołanie OpenAI Image API. Zwraca bajty pierwszego obrazu.
-    Obsługujemy zarówno `b64_json` jak i `url` w odpowiedzi.
-    """
-    # Wywołanie – dostosuj do wersji biblioteki jeśli trzeba.
-    try:
-        response = openai.Image.create(prompt=prompt, n=n, size=size)
-    except Exception as e:
-        raise RuntimeError(f"OpenAI API error: {e}")
+def initialize_openai_client():
+    """Inicjalizacja klienta OpenAI"""
+    api_key = st.secrets.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
-    data0 = response['data'][0]
-    # Jeśli mamy base64 w 'b64_json'
-    if 'b64_json' in data0:
-        image_bytes = base64.b64decode(data0['b64_json'])
-        return image_bytes
-    # Jeśli API zwróciło URL
-    if 'url' in data0:
-        url = data0['url']
-        r = requests.get(url)
-        if r.status_code == 200:
-            return r.content
-        else:
-            raise RuntimeError(f"Error downloading image from URL: {r.status_code}")
-    raise RuntimeError("Nieznany format odpowiedzi od OpenAI Image API")
-
-# ====== UI ======
-st.set_page_config(page_title="Generator obrazów AI (DALL·E)", layout="centered")
-st.title("Generator obrazów AI — szkic promptu + poprawki")
-
-st.markdown("""
-Wypełnij pola opisujące co chcesz zobaczyć na obrazie. Pole '**Negative prompt**' to co *unikać*.
-Naciśnij **Generuj**, aby utworzyć pierwszą wersję obrazu. Po wygenerowaniu możesz dopisać uwagi i kliknąć **Generuj poprawkę**.
-""")
-
-with st.form(key="prompt_form"):
-    st.subheader("1) Szablon promptu (wypełnij pola)")
-    subject = st.text_input("1. Temat główny (subject)", placeholder="np. młoda kobieta na rowerze")
-    attributes = st.text_area("2. Cechy szczegółowe (attributes)", placeholder="np. krótkie włosy, czerwony płaszcz, uśmiech")
-    style = st.text_area("3. Styl artystyczny / estetyka (style & aesthetics)", placeholder="np. realizm, fotografia, film noir, cyberpunk")
-    environment = st.text_area("4. Otoczenie / tło (environment / setting)", placeholder="np. brukowana uliczka, mgła, jesienny park")
-    composition = st.text_area("5. Kompozycja i perspektywa (composition / camera setup)", placeholder="np. zbliżenie 3/4, szeroki kąt, ISO 200")
-    extra = st.text_area("6. Dodatkowe efekty / atmosfera (extra details)", placeholder="np. światło złotej godziny, lekki bokeh")
-    negative = st.text_area("7. Negative prompt (czego unikać)", placeholder="np. zniekształcenia, artefakty, watermark")
-    submitted = st.form_submit_button("Generuj")
-
-# sekcja ustawień rozdzielczości / pobierania
-st.sidebar.header("Ustawienia obrazu / pobierania")
-size = st.sidebar.selectbox("Rozdzielczość (size)", options=["1024x1024","1792x1024","1024x1792"], index=0)
-file_format = st.sidebar.selectbox("Format pobrania", options=["png","jpg"], index=0)
-n_images = st.sidebar.slider("Ilość wariantów (n)", 1, 4, 1)
-
-# Przechowujemy w session_state ostatni prompt i obraz
-if "last_prompt" not in st.session_state:
-    st.session_state.last_prompt = ""
-if "last_image_bytes" not in st.session_state:
-    st.session_state.last_image_bytes = None
-
-# Generowanie pierwszej wersji
-if submitted:
-    fields = {
-        "subject": subject.strip(),
-        "attributes": attributes.strip(),
-        "style": style.strip(),
-        "environment": environment.strip(),
-        "composition": composition.strip(),
-        "extra": extra.strip(),
-        "negative": negative.strip()
-    }
-    prompt = make_prompt(fields)
-    st.session_state.last_prompt = prompt
-    st.info("Wysyłam zapytanie do OpenAI...")
-    try:
-        image_bytes = generate_image_from_openai(prompt=prompt, size=size, n=n_images)
-        st.session_state.last_image_bytes = image_bytes
-        st.success("Obraz wygenerowany.")
-    except Exception as e:
-        st.error(f"Błąd podczas generowania obrazu: {e}")
+    if not api_key:
+        st.error("⚠️ Brak klucza API OpenAI. Dodaj OPENAI_API_KEY do secrets.toml lub zmiennych środowiskowych.")
         st.stop()
 
-# Wyświetlenie obrazu i pole do modyfikacji
-if st.session_state.last_image_bytes:
-    st.subheader("Wynik (podgląd)")
-    st.image(st.session_state.last_image_bytes, use_column_width=True)
-    st.write("Oryginalny prompt (możesz go edytować):")
-    st.code(st.session_state.last_prompt, language="text")
+    return OpenAI(api_key=api_key)
 
-    # Pobieranie obrazu
-    if file_format == "png":
-        download_label = "Pobierz PNG"
-        mime = "image/png"
-    else:
-        download_label = "Pobierz JPG"
-        mime = "image/jpeg"
 
-    st.download_button(
-        label=download_label,
-        data=st.session_state.last_image_bytes,
-        file_name=f"ai_image.{file_format}",
-        mime=mime
+def construct_prompt(subject, attributes, style, environment, composition, effects, negative_prompt):
+    """Konstruowanie promptu na podstawie pól formularza"""
+    prompt_parts = []
+
+    if subject:
+        prompt_parts.append(f"Subject: {subject}")
+    if attributes:
+        prompt_parts.append(f"Details: {attributes}")
+    if style:
+        prompt_parts.append(f"Style: {style}")
+    if environment:
+        prompt_parts.append(f"Setting: {environment}")
+    if composition:
+        prompt_parts.append(f"Composition: {composition}")
+    if effects:
+        prompt_parts.append(f"Additional effects: {effects}")
+
+    main_prompt = ". ".join(prompt_parts)
+
+    if negative_prompt:
+        main_prompt += f". Avoid: {negative_prompt}"
+
+    return main_prompt
+
+
+def generate_image(client, prompt, size="1024x1024", quality="standard"):
+    """Generowanie obrazu za pomocą DALL-E"""
+    try:
+        with st.spinner("🎨 Generowanie obrazu..."):
+            response = client.images.generate(
+                model="dall-e-3",
+                prompt=prompt,
+                size=size,
+                quality=quality,
+                n=1,
+            )
+
+            return response.data[0].url, response.data[0].revised_prompt
+    except Exception as e:
+        st.error(f"Błąd podczas generowania obrazu: {str(e)}")
+        return None, None
+
+
+# def edit_image(client, image_url, modification_prompt, size="1024x1024"):
+#     """Modyfikacja obrazu (używa variation, ponieważ edit wymaga przezroczystości)"""
+#     try:
+#         with st.spinner("🔄 Modyfikowanie obrazu..."):
+#             # Konstruujemy nowy prompt łączący poprzedni z modyfikacją
+#             new_prompt = f"Based on the previous image, make the following changes: {modification_prompt}"
+#
+#             response = client.images.generate(
+#                 model="dall-e-3",
+#                 prompt=new_prompt,
+#                 size=size,
+#                 quality="standard",
+#                 n=1,
+#             )
+#
+#             return response.data[0].url, response.data[0].revised_prompt
+#     except Exception as e:
+#         st.error(f"Błąd podczas modyfikacji obrazu: {str(e)}")
+#         return None, None
+
+
+def download_image(image_url, quality_suffix=""):
+    """Pobieranie obrazu z URL"""
+    try:
+        response = requests.get(image_url)
+        response.raise_for_status()
+
+        # Tworzenie nazwy pliku z timestampem
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"dalle_image_{timestamp}{quality_suffix}.png"
+
+        return response.content, filename
+    except Exception as e:
+        st.error(f"Błąd podczas pobierania obrazu: {str(e)}")
+        return None, None
+
+
+# Interfejs użytkownika
+st.title("🎨 DALL-E Image Generator")
+st.markdown("Generuj i modyfikuj obrazy za pomocą sztucznej inteligencji OpenAI")
+
+# Sidebar z ustawieniami
+with st.sidebar:
+    st.header("⚙️ Ustawienia generacji")
+
+    # Rozmiar obrazu
+    size_options = {
+        "1024x1024": "Kwadratowy (1024x1024)",
+        "1792x1024": "Poziomy (1792x1024)",
+        "1024x1792": "Pionowy (1024x1792)"
+    }
+    selected_size = st.selectbox(
+        "Rozmiar obrazu:",
+        options=list(size_options.keys()),
+        format_func=lambda x: size_options[x]
     )
 
-    # Pole na poprawki/opisy do kolejnego wygenerowania
-    st.subheader("Poprawki / uwagi do kolejnej wersji")
-    modification = st.text_area("Napisz co zmienić (dodatkowe instrukcje dla modelu)", "")
-    if st.button("Generuj poprawkę"):
-        # Scal prompt z modyfikacją i generuj ponownie
-        new_prompt = st.session_state.last_prompt + "\nModification request: " + modification
-        st.session_state.last_prompt = new_prompt
-        st.info("Wysyłam poprawiony prompt do OpenAI...")
+    # Jakość obrazu
+    quality_options = {
+        "standard": "Standardowa",
+        "hd": "Wysoka (HD)"
+    }
+    selected_quality = st.selectbox(
+        "Jakość obrazu:",
+        options=list(quality_options.keys()),
+        format_func=lambda x: quality_options[x]
+    )
+
+# Inicjalizacja klienta OpenAI
+client = initialize_openai_client()
+
+# Główny interfejs
+col1, col2 = st.columns([1, 1])
+
+with col1:
+    st.header("📝 Opis obrazu")
+
+    with st.form("image_prompt_form"):
+        st.subheader("1. Temat główny (Subject)")
+        subject = st.text_area(
+            "Opisz główny obiekt/podmiot obrazu:",
+            placeholder="np. piękna kobieta, futurystyczne miasto, kot...",
+            height=80
+        )
+
+        st.subheader("2. Cechy szczegółowe (Attributes)")
+        attributes = st.text_area(
+            "Dodaj szczegółowe cechy i charakterystyki:",
+            placeholder="np. długie ciemne włosy, niebieskie oczy, elegancka sukienka...",
+            height=80
+        )
+
+        st.subheader("3. Styl artystyczny / estetyka (Style & Aesthetics)")
+        style = st.text_area(
+            "Określ styl artystyczny:",
+            placeholder="np. fotorealistyczny, malarstwo olejne, anime, cyberpunk...",
+            height=80
+        )
+
+        st.subheader("4. Otoczenie / tło (Environment / Setting)")
+        environment = st.text_area(
+            "Opisz otoczenie i tło:",
+            placeholder="np. górski krajobraz, nowoczesne wnętrze, ulica miasta...",
+            height=80
+        )
+
+        st.subheader("5. Kompozycja i perspektywa (Composition / Camera Setup)")
+        composition = st.text_area(
+            "Określ kompozycję i ujęcie:",
+            placeholder="np. portret, pełna postać, widok z lotu ptaka, makro...",
+            height=80
+        )
+
+        st.subheader("6. Dodatkowe efekty / atmosfera (Extra Details)")
+        effects = st.text_area(
+            "Dodaj efekty i atmosferę:",
+            placeholder="np. złote światło, mgła, deszcz, magiczne światło...",
+            height=80
+        )
+
+        st.subheader("7. Negative prompt (czego unikać)")
+        negative_prompt = st.text_area(
+            "Co ma być unikane na obrazie:",
+            placeholder="np. rozmazane, zniekształcone, złej jakości...",
+            height=80
+        )
+
+        generate_button = st.form_submit_button("🎨 Generuj obraz", type="primary")
+
+with col2:
+    st.header("🖼️ Wygenerowany obraz")
+
+    if generate_button:
+        # Konstruowanie promptu
+        full_prompt = construct_prompt(
+            subject, attributes, style, environment,
+            composition, effects, negative_prompt
+        )
+
+        if full_prompt.strip():
+            st.info(f"**Skonstruowany prompt:** {full_prompt}")
+
+            # Generowanie obrazu
+            image_url, revised_prompt = generate_image(
+                client, full_prompt, selected_size, selected_quality
+            )
+
+            if image_url:
+                st.session_state.current_image_url = image_url
+                st.session_state.image_history.append({
+                    "url": image_url,
+                    "prompt": full_prompt,
+                    "revised_prompt": revised_prompt,
+                    "timestamp": datetime.now()
+                })
+
+                st.success("✅ Obraz wygenerowany pomyślnie!")
+                if revised_prompt:
+                    st.info(f"**Zmodyfikowany prompt przez DALL-E:** {revised_prompt}")
+        else:
+            st.warning("⚠️ Wypełnij przynajmniej jedno pole opisu!")
+
+    # Wyświetlanie aktualnego obrazu
+    if st.session_state.current_image_url:
         try:
-            image_bytes = generate_image_from_openai(prompt=new_prompt, size=size, n=1)
-            st.session_state.last_image_bytes = image_bytes
-            st.success("Nowa wersja wygenerowana.")
-            st.experimental_rerun()
+            st.image(st.session_state.current_image_url, caption="Wygenerowany obraz", use_container_width=True)
+
+            # Sekcja pobierania
+            st.subheader("📥 Pobierz obraz")
+
+            download_col1, download_col2 = st.columns(2)
+
+            with download_col1:
+                if st.button("📱 Pobierz w jakości standardowej"):
+                    image_data, filename = download_image(st.session_state.current_image_url, "_standard")
+                    if image_data:
+                        st.download_button(
+                            label="💾 Zapisz plik",
+                            data=image_data,
+                            file_name=filename,
+                            mime="image/png"
+                        )
+
+            with download_col2:
+                if st.button("🖥️ Pobierz w jakości HD"):
+                    # Dla uproszczenia używamy tego samego obrazu
+                    # W rzeczywistości można by regenerować w wyższej jakości
+                    image_data, filename = download_image(st.session_state.current_image_url, "_hd")
+                    if image_data:
+                        st.download_button(
+                            label="💾 Zapisz plik HD",
+                            data=image_data,
+                            file_name=filename,
+                            mime="image/png"
+                        )
+
+            # # Sekcja modyfikacji
+            # st.subheader("✏️ Modyfikuj obraz")
+            #
+            # with st.form("modification_form"):
+            #     modification_prompt = st.text_area(
+            #         "Opisz jakie zmiany chcesz wprowadzić:",
+            #         placeholder="np. zmień kolor włosów na blond, dodaj okulary, usuń tło...",
+            #         height=100
+            #     )
+            #
+            #     modify_button = st.form_submit_button("🔄 Modyfikuj obraz", type="secondary")
+            #
+            #     if modify_button and modification_prompt.strip():
+            #         # Modyfikacja obrazu
+            #         new_image_url, new_revised_prompt = edit_image(
+            #             client, st.session_state.current_image_url,
+            #             modification_prompt, selected_size
+            #         )
+            #
+            #         if new_image_url:
+            #             st.session_state.current_image_url = new_image_url
+            #             st.session_state.image_history.append({
+            #                 "url": new_image_url,
+            #                 "prompt": modification_prompt,
+            #                 "revised_prompt": new_revised_prompt,
+            #                 "timestamp": datetime.now(),
+            #                 "is_modification": True
+            #             })
+            #
+            #             st.success("✅ Obraz zmodyfikowany pomyślnie!")
+            #             st.rerun()
+            #     elif modify_button:
+            #         st.warning("⚠️ Opisz jakie zmiany chcesz wprowadzić!")
+
         except Exception as e:
-            st.error(f"Błąd podczas generowania poprawki: {e}")
+            st.error(f"Błąd podczas wyświetlania obrazu: {str(e)}")
+
+# Historia obrazów
+if st.session_state.image_history:
+    st.header("📚 Historia wygenerowanych obrazów")
+
+    for i, img_data in enumerate(reversed(st.session_state.image_history[-5:])):  # Ostatnie 5 obrazów
+        with st.expander(
+                f"Obraz #{len(st.session_state.image_history) - i} - {img_data['timestamp'].strftime('%H:%M:%S')}"):
+            col_hist1, col_hist2 = st.columns([1, 2])
+
+            with col_hist1:
+                try:
+                    st.image(img_data["url"], use_container_width=True)
+                except:
+                    st.error("Nie można wyświetlić obrazu")
+
+            with col_hist2:
+                st.text(f"Typ: {'Modyfikacja' if img_data.get('is_modification') else 'Nowy obraz'}")
+                st.text(f"Prompt: {img_data['prompt'][:200]}...")
+                if img_data.get('revised_prompt'):
+                    st.text(f"Zmodyfikowany: {img_data['revised_prompt'][:200]}...")
+
+                if st.button(f"Użyj tego obrazu", key=f"use_img_{i}"):
+                    st.session_state.current_image_url = img_data["url"]
+                    st.rerun()
+
+# Stopka
+st.markdown("---")
+st.markdown("💡 **Wskazówka:** Im bardziej szczegółowe opisy, tym lepszy efekt końcowy!")
